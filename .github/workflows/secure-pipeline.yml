@@ -1,0 +1,237 @@
+# Reusable secure pipeline (workflow_call)
+# Pin this repo with tag "v1" and call from pipeline-runner.
+# SECURITY: never interpolate ${{ inputs.* }} directly inside run scripts;
+# always pass them via env: variables.
+
+name: Secure Pipeline
+
+on:
+  workflow_call:
+    inputs:
+      target_repo:
+        description: "owner/name of the repository to build"
+        type: string
+        required: true
+      branch:
+        description: "Branch to checkout and build"
+        type: string
+        required: true
+      environment:
+        description: "Deploy environment (none, dev, staging, prod)"
+        type: string
+        required: true
+        default: "none"
+      build_type:
+        description: "Build system (npm or python)"
+        type: string
+        required: true
+        default: "npm"
+      allowed_owners:
+        description: "Comma-separated list of allowed owners (from ALLOWED_OWNERS variable)"
+        type: string
+        required: true
+    secrets:
+      CROSS_REPO_TOKEN:
+        description: "Fine-grained PAT or GitHub App token with read access to target repos"
+        required: true
+
+# Deny by default at the workflow level; jobs request only what they need.
+permissions: {}
+
+jobs:
+  build:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+
+    steps:
+      - name: Validate inputs
+        env:
+          TARGET_REPO: ${{ inputs.target_repo }}
+          BRANCH: ${{ inputs.branch }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          BUILD_TYPE: ${{ inputs.build_type }}
+          ALLOWED_OWNERS: ${{ inputs.allowed_owners }}
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          fail() {
+            echo "::error::$1"
+            exit 1
+          }
+
+          # owner/name shape
+          if ! [[ "$TARGET_REPO" =~ ^[a-zA-Z0-9]([a-zA-Z0-9._-]*[a-zA-Z0-9])?/[a-zA-Z0-9]([a-zA-Z0-9._-]*[a-zA-Z0-9])?$ ]]; then
+            fail "target_repo must be owner/name (got: $TARGET_REPO)"
+          fi
+
+          OWNER="${TARGET_REPO%%/*}"
+          REPO_NAME="${TARGET_REPO#*/}"
+
+          # Owner allow-list (comma-separated, trimmed)
+          IFS=',' read -ra OWNERS <<< "$ALLOWED_OWNERS"
+          ALLOWED=false
+          for o in "${OWNERS[@]}"; do
+            o="$(echo "$o" | xargs)"  # trim whitespace
+            if [[ "$o" == "$OWNER" ]]; then
+              ALLOWED=true
+              break
+            fi
+          done
+          if [[ "$ALLOWED" != "true" ]]; then
+            fail "Owner '$OWNER' is not in ALLOWED_OWNERS"
+          fi
+
+          # Safe branch name (no path traversal)
+          if ! [[ "$BRANCH" =~ ^[a-zA-Z0-9][a-zA-Z0-9._/-]*$ ]] || [[ "$BRANCH" == *".."* ]]; then
+            fail "Unsafe branch name: $BRANCH"
+          fi
+
+          # Prod only from main or release/*
+          if [[ "$ENVIRONMENT" == "prod" ]]; then
+            if [[ "$BRANCH" != "main" && ! "$BRANCH" =~ ^release/ ]]; then
+              fail "Production deploys are only allowed from main or release/* (got: $BRANCH)"
+            fi
+          fi
+
+          # Verify repo + branch exist via GitHub API
+          if ! gh api "repos/$TARGET_REPO" --silent >/dev/null 2>&1; then
+            fail "Repository $TARGET_REPO does not exist or is not accessible with CROSS_REPO_TOKEN"
+          fi
+          if ! gh api "repos/$TARGET_REPO/branches/$BRANCH" --silent >/dev/null 2>&1; then
+            fail "Branch '$BRANCH' does not exist on $TARGET_REPO"
+          fi
+
+          echo "Validation passed for $TARGET_REPO@$BRANCH (env=$ENVIRONMENT, build=$BUILD_TYPE)"
+
+      - name: Checkout target repository
+        # Pin to a full commit SHA in production, e.g.:
+        # uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11  # v4.1.1
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.target_repo }}
+          ref: ${{ inputs.branch }}
+          path: workspace
+          fetch-depth: 1
+          persist-credentials: false
+          token: ${{ secrets.CROSS_REPO_TOKEN }}
+
+      - name: Cache dependencies
+        # Pin to a full commit SHA in production
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.npm
+            ~/.cache/pip
+          key: ${{ runner.os }}-${{ inputs.target_repo }}-${{ inputs.build_type }}-${{ hashFiles('workspace/package-lock.json', 'workspace/yarn.lock', 'workspace/pnpm-lock.yaml', 'workspace/requirements.txt', 'workspace/Pipfile.lock', 'workspace/poetry.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ inputs.target_repo }}-${{ inputs.build_type }}-
+
+      - name: Security scan (placeholder)
+        # Replace with real scanners pinned to SHAs, e.g.:
+        # uses: gitleaks/gitleaks-action@...  # full SHA
+        # uses: aquasecurity/trivy-action@...  # full SHA
+        run: |
+          echo "::warning::Security scan placeholder — integrate gitleaks and/or trivy here"
+          # Example (uncomment and pin):
+          # gitleaks detect --source workspace --verbose || true
+          # trivy fs --exit-code 1 --severity HIGH,CRITICAL workspace || true
+
+      - name: Build and test
+        working-directory: workspace
+        env:
+          BUILD_TYPE: ${{ inputs.build_type }}
+        run: |
+          set -euo pipefail
+          case "$BUILD_TYPE" in
+            npm)
+              npm ci --ignore-scripts
+              npm run build --if-present
+              npm test --if-present
+              ;;
+            python)
+              python -m pip install --upgrade pip
+              if [[ -f requirements.txt ]]; then
+                pip install -r requirements.txt
+              elif [[ -f pyproject.toml ]]; then
+                pip install .
+              fi
+              # Prefer pytest if present
+              if command -v pytest >/dev/null 2>&1 || python -c "import pytest" 2>/dev/null; then
+                pytest
+              else
+                python -m unittest discover -s . -p "test_*.py" || true
+              fi
+              ;;
+            *)
+              echo "::error::Unsupported build_type: $BUILD_TYPE"
+              exit 1
+              ;;
+          esac
+
+      - name: Upload build artifact
+        # Pin to a full commit SHA in production
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: workspace/dist
+          retention-days: 3
+          if-no-files-found: ignore
+
+      - name: Job summary
+        if: always()
+        env:
+          TARGET_REPO: ${{ inputs.target_repo }}
+          BRANCH: ${{ inputs.branch }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          BUILD_TYPE: ${{ inputs.build_type }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          {
+            echo "### Secure Pipeline Summary"
+            echo ""
+            echo "| Field | Value |"
+            echo "|-------|-------|"
+            echo "| Target | \`$TARGET_REPO\` |"
+            echo "| Branch | \`$BRANCH\` |"
+            echo "| Environment | \`$ENVIRONMENT\` |"
+            echo "| Build type | \`$BUILD_TYPE\` |"
+            echo "| Status | \`$JOB_STATUS\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  deploy:
+    name: Deploy
+    needs: build
+    if: inputs.environment != 'none'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: ${{ inputs.environment }}   # uses GitHub Environment (add required reviewers for staging/prod)
+    permissions:
+      contents: read
+      id-token: write   # for OIDC to cloud providers — no long-lived keys
+
+    steps:
+      - name: Download artifact
+        # Pin to a full commit SHA in production
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+
+      - name: Deploy (placeholder — OIDC)
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          TARGET_REPO: ${{ inputs.target_repo }}
+        run: |
+          set -euo pipefail
+          echo "Deploying artifact for $TARGET_REPO to environment: $ENVIRONMENT"
+          echo "::notice::Replace this step with real OIDC login + deploy (e.g. aws-actions/configure-aws-credentials, azure/login, google-github-actions/auth)"
+          # Example skeleton (pin actions to SHAs):
+          # - uses: aws-actions/configure-aws-credentials@...
+          #   with:
+          #     role-to-assume: arn:aws:iam::ACCOUNT:role/github-deploy
+          #     aws-region: us-east-1
+          # - run: aws s3 sync dist/ s3://my-bucket/ ...
